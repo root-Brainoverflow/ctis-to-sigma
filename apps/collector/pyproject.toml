@@ -2,10 +2,10 @@
 name = "cts-collector"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["playwright>=1.48", "typer>=0.12", "rich>=13"]
+dependencies = ["playwright>=1.48", "typer>=0.12", "rich>=13", "python-dateutil>=2.9"]
 
 [project.scripts]
-cts = "cli:app"  # flat module 진입점
+cts = "cli:app"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

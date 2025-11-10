@@ -58,7 +58,7 @@ def collect_setup(
     except subprocess.CalledProcessError:
         ok = False
 
-    print(f"playwright: {'ok' if ok else 'missing'}")
+    print(f"playwright: {'Already installed' if ok else 'missing'}")
     if not ok and install:
         print("installing chromium...")
         subprocess.run(

@@ -1,11 +1,20 @@
 import asyncio
+import json
 from collections import defaultdict
 from pathlib import Path
-from typing import Set, Dict, List
+from typing import Set, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
-from playwright.async_api import async_playwright
 from datetime import datetime
 import re
+
+from playwright.async_api import async_playwright
+
+# Optional: improve date parsing if dateutil is available
+try:
+    from dateutil import parser as du_parser  # type: ignore
+    HAVE_DATEUTIL = True
+except Exception:
+    HAVE_DATEUTIL = False
 
 
 class LinkCollector:
@@ -14,8 +23,10 @@ class LinkCollector:
         self.output_file = output_file
         self.collected_links: Set[str] = set()
         self.links_by_source: Dict[str, List[str]] = {}
+        self.link_dates: Dict[str, datetime] = {}  # per-link publish datetime
         self.max_concurrent_pages = 5
         self.max_concurrent_sites = 3
+        self.max_concurrent_date_fetches = 8
 
     async def collect_links(self):
         """Read URLs from base_url.txt and collect report links across multiple pages."""
@@ -28,7 +39,6 @@ class LinkCollector:
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            # Set a realistic UA to avoid simple headless blocking
             browser_context = await browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -62,7 +72,7 @@ class LinkCollector:
             await self._process_single_site(browser_context, base_url, site_num, total_sites)
 
     async def _process_single_site(self, browser_context, base_url, site_num, total_sites):
-        """Process a single site."""
+        """Process a single site, enrich dates for new links, and store by source."""
         print(f"\n[{site_num}/{total_sites}] Processing: {base_url}")
 
         initial_collected_links = set(self.collected_links)
@@ -83,10 +93,239 @@ class LinkCollector:
                 if self._is_link_from_domain(link, current_domain):
                     new_links_for_this_site.append(link)
 
+        # Enrich publish dates for new links (skip ones already set from listing scrape)
+        await self._enrich_dates(browser_context, new_links_for_this_site, site_num)
+
         self.links_by_source[base_url] = new_links_for_this_site
 
         print(f"[{site_num}] Done: collected {len(new_links_for_this_site)} new links (from this site)")
         print(f"[{site_num}] Total links collected so far: {len(self.collected_links)}")
+
+    async def _enrich_dates(self, browser_context, links: List[str], site_num: int):
+        """Populate self.link_dates for given links using URL hints and page metadata."""
+        sem = asyncio.Semaphore(self.max_concurrent_date_fetches)
+
+        async def work(url: str):
+            if url in self.link_dates:
+                return
+            # 1) quick from URL path
+            dt = self._date_from_url(url)
+            if not dt:
+                # 2) open article page to find published date
+                dt = await self._extract_date_from_page(browser_context, url, site_num)
+            if dt:
+                self.link_dates[url] = dt
+
+        await asyncio.gather(*(self._with_sem(sem, work, u) for u in links))
+
+    async def _with_sem(self, sem: asyncio.Semaphore, fn, *args, **kwargs):
+        async with sem:
+            return await fn(*args, **kwargs)
+
+    def _date_from_url(self, url: str) -> Optional[datetime]:
+        """Infer date from URL path if it encodes a date."""
+        u = url.lower()
+
+        # /YYYY/MM/DD/
+        m = re.search(r"/(20\d{2})/([01]?\d)/([0-3]?\d)/", u)
+        if m:
+            y, mo, d = map(int, m.groups())
+            return self._safe_dt(y, mo, d)
+
+        # /YYYY-MM-DD/ or /YYYY.MM.DD/
+        m = re.search(r"/(20\d{2})[-./]([01]?\d)[-./]([0-3]?\d)/", u)
+        if m:
+            y, mo, d = map(int, m.groups())
+            return self._safe_dt(y, mo, d)
+
+        return None
+
+    async def _extract_date_from_page(self, browser_context, url: str, site_num: int) -> Optional[datetime]:
+        """Open article page and try JSON-LD, meta, <time>, and headers."""
+        page = await browser_context.new_page()
+        try:
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+
+            # 0) HTTP header: Last-Modified
+            try:
+                if resp:
+                    last_mod = await resp.header_value("last-modified")  # type: ignore[attr-defined]
+                    dt = self._parse_date_string(last_mod)
+                    if dt:
+                        header_dt = dt  # keep as low-priority fallback
+                    else:
+                        header_dt = None
+                else:
+                    header_dt = None
+            except Exception:
+                header_dt = None
+
+            # 1) JSON-LD (BlogPosting / NewsArticle)
+            try:
+                scripts = await page.locator('script[type="application/ld+json"]').all_inner_texts()
+                for raw in scripts:
+                    for obj in self._iter_jsonld_objects(raw):
+                        for key in ("datePublished", "dateCreated", "uploadDate", "pubDate"):
+                            if key in obj and obj[key]:
+                                dt = self._parse_date_string(str(obj[key]))
+                                if dt:
+                                    return dt
+                        # nested mainEntity or article body containers
+                        if "mainEntity" in obj and isinstance(obj["mainEntity"], dict):
+                            for key in ("datePublished", "dateCreated"):
+                                val = obj["mainEntity"].get(key)
+                                if val:
+                                    dt = self._parse_date_string(str(val))
+                                    if dt:
+                                        return dt
+            except Exception:
+                pass
+
+            # 2) meta tags
+            meta_candidates = [
+                'meta[property="article:published_time"]',
+                'meta[name="pubdate"]',
+                'meta[name="publishdate"]',
+                'meta[name="date"]',
+                'meta[name="timestamp"]',
+                'meta[property="og:published_time"]',
+                'meta[property="article:modified_time"]',
+                'meta[property="og:updated_time"]',
+            ]
+            for sel in meta_candidates:
+                try:
+                    el = page.locator(sel).first
+                    if await el.count():
+                        val = await el.get_attribute("content")
+                        dt = self._parse_date_string(val)
+                        if dt:
+                            return dt
+                except Exception:
+                    pass
+
+            # 3) time elements and common date spans
+            time_candidates = [
+                "time[datetime]",
+                "time.entry-date",
+                "span.posted-on time",
+                "span.post-meta time",
+                "span.post-date",
+                "div.post-meta time",
+                "div.blog-post-meta time",
+                "span.entry-date",
+                "div.entry-meta time",
+            ]
+            for sel in time_candidates:
+                try:
+                    el = page.locator(sel).first
+                    if await el.count():
+                        attr = await el.get_attribute("datetime")
+                        dt = self._parse_date_string(attr) if attr else None
+                        if dt:
+                            return dt
+                        text = (await el.text_content() or "").strip()
+                        dt = self._parse_date_string(text)
+                        if dt:
+                            return dt
+                except Exception:
+                    pass
+
+            # 4) site-specific: Genians sometimes shows "25.10.28" near title
+            domain = urlparse(url).netloc.lower()
+            if "genians.co.kr" in domain:
+                try:
+                    near = page.locator(
+                        ":text-matches('^\\d{2,4}[.\\-/]\\d{1,2}[.\\-/]\\d{1,2}$')"
+                    ).first
+                    if await near.count():
+                        text = (await near.text_content() or "").strip()
+                        dt = self._parse_date_string(text)
+                        if dt:
+                            return dt
+                except Exception:
+                    pass
+
+            # 5) header fallback
+            if header_dt:
+                return header_dt
+
+            # 6) scan raw HTML for datetime=
+            html = await page.content()
+            m = re.search(r'datetime="([^"]+)"', html, flags=re.IGNORECASE)
+            if m:
+                dt = self._parse_date_string(m.group(1))
+                if dt:
+                    return dt
+
+            return None
+        except Exception as e:
+            print(f"  [*] Date parse failed for {url}: {e}")
+            return None
+        finally:
+            await page.close()
+
+    def _iter_jsonld_objects(self, raw: str):
+        """Yield JSON objects from a LD+JSON script. Handles arrays and nested dicts safely."""
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return []
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    yield item
+        elif isinstance(data, dict):
+            yield data
+
+    def _parse_date_string(self, s: Optional[str]) -> Optional[datetime]:
+        """Parse various date string formats to naive datetime."""
+        if not s:
+            return None
+        s = s.strip()
+
+        # Prefer python-dateutil when available
+        if HAVE_DATEUTIL:
+            try:
+                dt = du_parser.parse(s, fuzzy=True, dayfirst=False)  # keep month-first default
+                return dt.replace(tzinfo=None)
+            except Exception:
+                pass
+
+        # ISO-8601 like
+        try:
+            iso = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso)
+            return dt.replace(tzinfo=None)
+        except Exception:
+            pass
+
+        # yyyy-mm-dd or yyyy/mm/dd or yyyy.mm.dd
+        m = re.match(r"^(20\d{2})[-/.]([01]?\d)[-/.]([0-3]?\d)$", s)
+        if m:
+            y, mo, d = map(int, m.groups())
+            return self._safe_dt(y, mo, d)
+
+        # yy.mm.dd or yy-mm-dd (assume 2000s)
+        m = re.match(r"^(\d{2})[-/.]([01]?\d)[-/.]([0-3]?\d)$", s)
+        if m:
+            y2, mo, d = map(int, m.groups())
+            y = 2000 + y2
+            return self._safe_dt(y, mo, d)
+
+        # dd Month yyyy or Month dd, yyyy
+        for fmt in ("%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y"):
+            try:
+                return datetime.strptime(s, fmt)
+            except Exception:
+                continue
+
+        return None
+
+    def _safe_dt(self, y: int, mo: int, d: int) -> Optional[datetime]:
+        try:
+            return datetime(int(y), int(mo), int(d))
+        except ValueError:
+            return None
 
     def _is_link_from_domain(self, link: str, expected_domain: str) -> bool:
         """Check if a link belongs to the expected domain (allow sub/super domains by mapping)."""
@@ -101,13 +340,14 @@ class LinkCollector:
                 "research.checkpoint.com": ["research.checkpoint.com"],
                 "checkpoint.com": ["research.checkpoint.com", "checkpoint.com"],
                 "thedfirreport.com": ["thedfirreport.com"],
+                "www.genians.co.kr": ["www.genians.co.kr", "genians.co.kr"],
+                "genians.co.kr": ["www.genians.co.kr", "genians.co.kr"],
             }
 
             for domain_key, allowed_domains in domain_mapping.items():
                 if domain_key in expected_domain:
                     return link_domain in allowed_domains
 
-            # Fallback: allow sub/super domain match
             return (
                 expected_domain == link_domain
                 or expected_domain in link_domain
@@ -199,7 +439,6 @@ class LinkCollector:
                         for button in buttons:
                             if await button.is_visible():
                                 await button.click()
-                                # Wait briefly then for network to go idle to ensure content is appended
                                 await page.wait_for_timeout(400)
                                 await page.wait_for_load_state("networkidle")
                                 click_count += 1
@@ -266,7 +505,6 @@ class LinkCollector:
             results = await asyncio.gather(*tasks)
 
             any_new_links = False
-            # FIX: use enumerate instead of results.index() to avoid wrong page mapping
             for idx, page_links in enumerate(results):
                 if page_links:
                     new_links = page_links - self.collected_links
@@ -293,7 +531,6 @@ class LinkCollector:
         """Open one page, wait for content, extract candidate links, and filter them."""
         page = await browser_context.new_page()
         try:
-            # Use 'networkidle' to allow dynamic lists to populate
             await page.goto(url, wait_until="networkidle", timeout=15000)
             links = await self._extract_links(page)
             return links
@@ -304,7 +541,8 @@ class LinkCollector:
             await page.close()
 
     async def _extract_links(self, page) -> set:
-        """Extract anchors from the current document with domain-tuned selectors, then filter."""
+        """Extract anchors from the current document with domain-tuned selectors, then filter.
+           For some sites, also capture publish dates from the listing cards."""
         try:
             links = set()
             current_domain = urlparse(page.url).netloc.lower()
@@ -315,14 +553,39 @@ class LinkCollector:
             elif "fortinet.com" in current_domain:
                 selectors = ["h2 a", ".post-title a"]
             elif "checkpoint.com" in current_domain:
-                # Collect broadly on Check Point; filter later
                 selectors = ["a"]
+            elif "genians.co.kr" in current_domain:
+                # Extract links and dates from listing cards when available
+                cards = await page.locator("div.post-content").all()
+                for card in cards:
+                    try:
+                        a = card.locator("h2.entry-title a").first
+                        if not await a.count():
+                            a = card.locator(".entry-title a").first
+                        href = await a.get_attribute("href") if await a.count() else None
+                        if href:
+                            absolute_url = urljoin(page.url, href)
+                            links.add(absolute_url)
+                            # Try to read date text near meta
+                            meta = card.locator("div.post-meta, span.post-date, time[datetime]").first
+                            date_text = None
+                            if await meta.count():
+                                date_text = await meta.get_attribute("datetime")
+                                if not date_text:
+                                    date_text = (await meta.text_content() or "").strip()
+                            dt = self._parse_date_string(date_text) if date_text else None
+                            if dt:
+                                self.link_dates[absolute_url] = dt
+                    except Exception:
+                        continue
+                # Also fallback to generic selectors
+                selectors = ["h2.entry-title a", ".entry-title a", "h2 a"]
             elif "asec.ahnlab.com" in current_domain:
                 selectors = ["h2 a", "h3 a", ".entry-title a", 'a[href*="/ko/"]']
             else:
                 selectors = ["h2 a", "h3 a"]
 
-            # Gather raw links
+            # Gather raw links via selectors
             for selector in selectors:
                 try:
                     elements = await page.locator(selector).all()
@@ -364,8 +627,14 @@ class LinkCollector:
             return False
 
         elif "checkpoint.com" in domain:
-            # research.checkpoint.com/2025/<title> shape, allow 2020s broadly
             if any(y in url_lower for y in ["2025", "2024", "2023", "2022", "2021"]):
+                return True
+            return False
+
+        elif "genians.co.kr" in domain:
+            if "/page/" in url_lower:
+                return False
+            if re.search(r"/blog/[^/]+/[^/#?]+/?$", url_lower):
                 return True
             return False
 
@@ -383,7 +652,6 @@ class LinkCollector:
 
         url_lower = url.lower()
 
-        # Exclude social media
         social_media = [
             "facebook.com",
             "twitter.com",
@@ -394,17 +662,14 @@ class LinkCollector:
             "github.com",
         ]
 
-        # Exclude obvious non-HTML resources
         file_extensions = [".jpg", ".jpeg", ".png", ".gif", ".pdf", ".zip"]
 
         if not current_domain:
             current_domain = urlparse(current_url).netloc.lower()
 
-        # Domain-specific exclusion relaxation
         if "checkpoint.com" in current_domain:
             exclude_patterns = ["mailto:", "javascript:", "#", "facebook.com", "twitter.com", "linkedin.com"]
         else:
-            # Generic exclusions for category/tags/search/etc.
             exclude_patterns = [
                 "mailto:",
                 "javascript:",
@@ -448,15 +713,12 @@ class LinkCollector:
             if pattern in url_lower:
                 return False
 
-        # Exclude bare homepages
         if re.search(r"^https?://[^/]+/?$", url_lower):
             return False
 
-        # Must look like an actual content URL
         if not self._is_actual_content_url(url_lower, current_domain):
             return False
 
-        # Only allow same-domain or sub/superdomain
         try:
             link_domain = urlparse(url).netloc.lower()
             if (
@@ -470,7 +732,7 @@ class LinkCollector:
             return False
 
     def _save_urls_by_section(self):
-        """Save collected URLs grouped by base_url to the output file."""
+        """Save collected URLs grouped by base_url, sorted by publish date desc."""
         try:
             existing_content = ""
             if Path(self.output_file).exists():
@@ -488,10 +750,16 @@ class LinkCollector:
                 for base_url in reversed(base_urls):
                     links = self.links_by_source[base_url]
                     if links:
+                        # sort by date desc; unknown dates go last
+                        def sort_key(u: str):
+                            return self.link_dates.get(u, datetime(1970, 1, 1))
+
+                        sorted_links = sorted(links, key=sort_key, reverse=True)
+
                         f.write(f"## {base_url}\n")
-                        f.write(f"# Collected: {len(links)} links\n")
+                        f.write(f"# Collected: {len(sorted_links)} links\n")
                         f.write(f"# Date: {current_time}\n\n")
-                        for link in sorted(links, reverse=True):
+                        for link in sorted_links:
                             f.write(f"{link}\n")
                         f.write("\n")
 
