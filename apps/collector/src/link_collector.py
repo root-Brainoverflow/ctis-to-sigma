@@ -1,11 +1,11 @@
 import asyncio
 import json
+import re
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Set, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
-from datetime import datetime
-import re
 
 from playwright.async_api import async_playwright
 
@@ -46,6 +46,9 @@ class LinkCollector:
                 ),
                 java_script_enabled=True,
             )
+            # block heavy/noisy resources for faster, less flaky loads
+            await browser_context.route("**/*", self._route_blocker)
+
             try:
                 semaphore = asyncio.Semaphore(self.max_concurrent_sites)
                 tasks = []
@@ -65,6 +68,24 @@ class LinkCollector:
         print(f"\nSaved to: {Path(self.output_file).absolute()}")
         print(f"Saved a total of {len(self.collected_links)} links to {self.output_file}.")
         self._summarize_links()
+
+    async def _route_blocker(self, route):
+        """Abort useless resources and trackers to reduce timeouts."""
+        try:
+            req = route.request
+            rtype = req.resource_type
+            if rtype in ("image", "media", "font"):
+                return await route.abort()
+            url = req.url
+            noisy = (
+                "googletagmanager", "google-analytics", "doubleclick",
+                "facebook", "twitter", "hotjar", "adservice", "optimizely"
+            )
+            if any(x in url for x in noisy):
+                return await route.abort()
+            return await route.continue_()
+        except Exception:
+            return await route.continue_()
 
     async def _process_site_with_semaphore(self, semaphore, browser_context, base_url, site_num, total_sites):
         """Process one site while respecting a semaphore limit."""
@@ -143,6 +164,7 @@ class LinkCollector:
     async def _extract_date_from_page(self, browser_context, url: str, site_num: int) -> Optional[datetime]:
         """Open article page and try JSON-LD, meta, <time>, and headers."""
         page = await browser_context.new_page()
+        header_dt = None
         try:
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=20000)
 
@@ -152,13 +174,9 @@ class LinkCollector:
                     last_mod = await resp.header_value("last-modified")  # type: ignore[attr-defined]
                     dt = self._parse_date_string(last_mod)
                     if dt:
-                        header_dt = dt  # keep as low-priority fallback
-                    else:
-                        header_dt = None
-                else:
-                    header_dt = None
+                        header_dt = dt
             except Exception:
-                header_dt = None
+                pass
 
             # 1) JSON-LD (BlogPosting / NewsArticle)
             try:
@@ -170,7 +188,6 @@ class LinkCollector:
                                 dt = self._parse_date_string(str(obj[key]))
                                 if dt:
                                     return dt
-                        # nested mainEntity or article body containers
                         if "mainEntity" in obj and isinstance(obj["mainEntity"], dict):
                             for key in ("datePublished", "dateCreated"):
                                 val = obj["mainEntity"].get(key)
@@ -286,7 +303,7 @@ class LinkCollector:
         # Prefer python-dateutil when available
         if HAVE_DATEUTIL:
             try:
-                dt = du_parser.parse(s, fuzzy=True, dayfirst=False)  # keep month-first default
+                dt = du_parser.parse(s, fuzzy=True, dayfirst=False)
                 return dt.replace(tzinfo=None)
             except Exception:
                 pass
@@ -439,6 +456,7 @@ class LinkCollector:
                         for button in buttons:
                             if await button.is_visible():
                                 await button.click()
+                                # Wait briefly then for network idle, or at least for selector
                                 await page.wait_for_timeout(400)
                                 await page.wait_for_load_state("networkidle")
                                 click_count += 1
@@ -492,11 +510,11 @@ class LinkCollector:
             semaphore = asyncio.Semaphore(self.max_concurrent_pages)
             tasks = []
             for page in batch_pages:
-                # Domain-specific pagination shape
+                # Normalize base to avoid double slashes and keep trailing slash for WP
+                base = base_url.rstrip("/")
+                url = f"{base}/page/{page}/"
                 if "checkpoint.com" in current_domain:
-                    url = f"{base_url.rstrip('/')}/page/{page}/"
-                else:
-                    url = f"{base_url}/page/{page}"
+                    url = f"{base}/page/{page}/"
                 task = self._extract_links_from_single_page_with_semaphore(
                     semaphore, browser_context, url, page, site_num
                 )
@@ -527,11 +545,70 @@ class LinkCollector:
         async with semaphore:
             return await self._extract_links_from_single_page(browser_context, url, page_num, site_num)
 
+    async def _goto_with_retry(self, page, url: str, listing_selectors: List[str]) -> bool:
+        """Navigate with fallbacks: networkidle -> domcontentloaded -> load + selector wait."""
+        # try 1: networkidle
+        try:
+            resp = await page.goto(url, wait_until="networkidle", timeout=20000)
+            if resp and resp.status >= 400:
+                return False
+            for sel in listing_selectors:
+                try:
+                    await page.wait_for_selector(sel, timeout=2000)
+                    return True
+                except Exception:
+                    continue
+            return True
+        except Exception:
+            pass
+
+        # try 2: domcontentloaded
+        try:
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            if resp and resp.status >= 400:
+                return False
+            for sel in listing_selectors:
+                try:
+                    await page.wait_for_selector(sel, timeout=3000)
+                    return True
+                except Exception:
+                    continue
+            await page.wait_for_timeout(800)
+            return True
+        except Exception:
+            pass
+
+        # try 3: commit + load + tiny wait
+        try:
+            await page.goto(url, wait_until="commit", timeout=15000)
+            await page.wait_for_load_state("load")
+            for sel in listing_selectors:
+                try:
+                    await page.wait_for_selector(sel, timeout=2000)
+                    return True
+                except Exception:
+                    continue
+            await page.wait_for_timeout(1000)
+            return True
+        except Exception:
+            return False
+
     async def _extract_links_from_single_page(self, browser_context, url: str, page_num: int, site_num: int) -> set:
         """Open one page, wait for content, extract candidate links, and filter them."""
         page = await browser_context.new_page()
         try:
-            await page.goto(url, wait_until="networkidle", timeout=15000)
+            domain = urlparse(url).netloc.lower()
+            if "asec.ahnlab.com" in domain:
+                listing_selectors = ["article", ".entry-title a", "h2 a"]
+            elif "genians.co.kr" in domain:
+                listing_selectors = ["h2.entry-title a", ".entry-title a", "article"]
+            else:
+                listing_selectors = ["h2 a", "h3 a", ".entry-title a", "article"]
+
+            ok = await self._goto_with_retry(page, url, listing_selectors)
+            if not ok:
+                return set()
+
             links = await self._extract_links(page)
             return links
         except Exception as e:
@@ -556,7 +633,7 @@ class LinkCollector:
                 selectors = ["a"]
             elif "genians.co.kr" in current_domain:
                 # Extract links and dates from listing cards when available
-                cards = await page.locator("div.post-content").all()
+                cards = await page.locator("div.post-content, article").all()
                 for card in cards:
                     try:
                         a = card.locator("h2.entry-title a").first
@@ -567,7 +644,7 @@ class LinkCollector:
                             absolute_url = urljoin(page.url, href)
                             links.add(absolute_url)
                             # Try to read date text near meta
-                            meta = card.locator("div.post-meta, span.post-date, time[datetime]").first
+                            meta = card.locator("time[datetime], div.post-meta, span.post-date").first
                             date_text = None
                             if await meta.count():
                                 date_text = await meta.get_attribute("datetime")
@@ -746,16 +823,17 @@ class LinkCollector:
                 f.write(f"# Last Updated: {current_time}\n")
                 f.write(f"# Total Links: {len(self.collected_links)}\n\n")
 
-                base_urls = list(self.links_by_source.keys())
-                for base_url in reversed(base_urls):
-                    links = self.links_by_source[base_url]
-                    if links:
-                        # sort by date desc; unknown dates go last
-                        def sort_key(u: str):
-                            return self.link_dates.get(u, datetime(1970, 1, 1))
+            base_urls = list(self.links_by_source.keys())
+            for base_url in reversed(base_urls):
+                links = self.links_by_source[base_url]
+                if links:
+                    # sort by date desc; unknown dates go last
+                    def sort_key(u: str):
+                        return self.link_dates.get(u, datetime(1970, 1, 1))
 
-                        sorted_links = sorted(links, key=sort_key, reverse=True)
+                    sorted_links = sorted(links, key=sort_key, reverse=True)
 
+                    with open(self.output_file, "a", encoding="utf-8") as f:
                         f.write(f"## {base_url}\n")
                         f.write(f"# Collected: {len(sorted_links)} links\n")
                         f.write(f"# Date: {current_time}\n\n")
@@ -763,7 +841,8 @@ class LinkCollector:
                             f.write(f"{link}\n")
                         f.write("\n")
 
-                if existing_content.strip() and not existing_content.startswith("# CTI Links Collection"):
+            if existing_content.strip() and not existing_content.startswith("# CTI Links Collection"):
+                with open(self.output_file, "a", encoding="utf-8") as f:
                     f.write("# =================== Previous Collections ===================\n\n")
                     f.write(existing_content)
 
