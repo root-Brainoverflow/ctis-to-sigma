@@ -11,9 +11,9 @@ uv run cts collect setup
 ```
 
 ```bash
-uv run cts collect run -b base_url.txt -o data/urls.txt
-uv run cts collect run -b base_url.txt -o data/urls.txt -m safe
-uv run cts collect run -b base_url.txt -o data/urls.txt -m aggressive
+cts collect run -b base_url.txt -o data/urls.txt
+cts collect run -b base_url.txt -o data/urls.txt -m safe
+cts collect run -b base_url.txt -o data/urls.txt -m aggressive
 CTS_MAX_CONCURRENT_SITES=4 CTS_MAX_CONCURRENT_PAGES=6 \
-uv run cts collect run -b base_url.txt -o data/urls.txt
+cts collect run -b base_url.txt -o data/urls.txt
 ```
