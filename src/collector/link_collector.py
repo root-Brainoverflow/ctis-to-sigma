@@ -1,11 +1,10 @@
-
 import asyncio
 import json
 import re
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Set, Dict, List, Optional
+from typing import Set, Dict, List, Optional, Callable, Awaitable
 from urllib.parse import urljoin, urlparse
 
 from playwright.async_api import async_playwright
@@ -24,10 +23,14 @@ class LinkCollector:
         self.output_file = output_file
         self.collected_links: Set[str] = set()
         self.links_by_source: Dict[str, List[str]] = {}
-        self.link_dates: Dict[str, datetime] = {}  # per-link publish datetime
+        self.link_dates: Dict[str, datetime] = {}
         self.max_concurrent_pages = 5
         self.max_concurrent_sites = 3
         self.max_concurrent_date_fetches = 8
+        
+        # Event callbacks
+        self.on_site_start: Optional[Callable[[str], Awaitable[None]]] = None
+        self.on_site_complete: Optional[Callable[[str, int, bool], Awaitable[None]]] = None
 
     async def collect_links(self):
         """Read URLs from base_url.txt and collect report links across multiple pages."""
@@ -95,33 +98,45 @@ class LinkCollector:
 
     async def _process_single_site(self, browser_context, base_url, site_num, total_sites):
         """Process a single site, enrich dates for new links, and store by source."""
-        print(f"\n[{site_num}/{total_sites}] Processing: {base_url}")
+        # Notify start
+        if self.on_site_start:
+            await self.on_site_start(base_url)
 
         initial_collected_links = set(self.collected_links)
+        success = True
 
-        site_type = await self._detect_site_type(browser_context, base_url)
-        print(f"[{site_num}] Site type: {site_type}")
+        try:
+            site_type = await self._detect_site_type(browser_context, base_url)
+            print(f"[{site_num}] Site type: {site_type}")
 
-        if site_type == "load_more":
-            await self._collect_load_more_site(browser_context, base_url, site_num)
-        else:
-            await self._collect_paginated_site_parallel(browser_context, base_url, site_num)
+            if site_type == "load_more":
+                await self._collect_load_more_site(browser_context, base_url, site_num)
+            else:
+                await self._collect_paginated_site_parallel(browser_context, base_url, site_num)
 
-        # Keep only new links from this site
-        new_links_for_this_site: List[str] = []
-        current_domain = urlparse(base_url).netloc.lower()
-        for link in self.collected_links:
-            if link not in initial_collected_links:
-                if self._is_link_from_domain(link, current_domain):
-                    new_links_for_this_site.append(link)
+            # Keep only new links from this site
+            new_links_for_this_site: List[str] = []
+            current_domain = urlparse(base_url).netloc.lower()
+            for link in self.collected_links:
+                if link not in initial_collected_links:
+                    if self._is_link_from_domain(link, current_domain):
+                        new_links_for_this_site.append(link)
 
-        # Enrich publish dates for new links (skip ones already set from listing scrape)
-        await self._enrich_dates(browser_context, new_links_for_this_site, site_num)
+            # Enrich publish dates for new links
+            await self._enrich_dates(browser_context, new_links_for_this_site, site_num)
 
-        self.links_by_source[base_url] = new_links_for_this_site
+            self.links_by_source[base_url] = new_links_for_this_site
 
-        print(f"[{site_num}] Done: collected {len(new_links_for_this_site)} new links (from this site)")
-        print(f"[{site_num}] Total links collected so far: {len(self.collected_links)}")
+            print(f"[{site_num}] Done: collected {len(new_links_for_this_site)} new links (from this site)")
+            print(f"[{site_num}] Total links collected so far: {len(self.collected_links)}")
+        except Exception as e:
+            success = False
+            new_links_for_this_site = []
+            print(f"  [{site_num}] Error processing {base_url}: {str(e)}")
+
+        # Notify completion
+        if self.on_site_complete:
+            await self.on_site_complete(base_url, len(new_links_for_this_site), success)
 
     async def _enrich_dates(self, browser_context, links: List[str], site_num: int):
         """Populate self.link_dates for given links using URL hints and page metadata."""
