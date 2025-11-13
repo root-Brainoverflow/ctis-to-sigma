@@ -1,10 +1,10 @@
 import subprocess
 import typer
-from typing import Optional
+from pathlib import Path
 from rich import print
 
 from src.collector.commands import collect_run
-# from src.parser.commands import parse_run  # parser 구현 시 주석 해제
+from src.extractor.browser_async import extract_run
 
 cli = typer.Typer(add_completion=False, no_args_is_help=True)
 
@@ -15,7 +15,7 @@ def setup(
         False, "--install", help="Install all dependencies (Playwright, etc.)"
     ),
 ):
-    """Check and install dependencies for collector and parser."""
+    """Check and install dependencies for collector, extractor and parser."""
     # Playwright 체크
     ok = True
     try:
@@ -38,7 +38,6 @@ def setup(
         )
         print("[green]Playwright installed.[/green]")
     
-    # TODO: Parser 관련 의존성 체크 추가
     if install and ok:
         print("[green]All dependencies are already installed.[/green]")
 
@@ -59,6 +58,29 @@ def collect(
     collect_run(base_url_file, output_file, mode)
 
 
+@cli.command("extract")
+def extract(
+    url_file: Path = typer.Option(
+        ..., "--url-file", "-i", help="Text file with one URL per line"
+    ),
+    out_dir: Path = typer.Option(
+        Path("output"), "--out-dir", "-o", help="Output directory"
+    ),
+    timeout_s: int = typer.Option(
+        30, help="Per-URL navigation timeout (seconds)"
+    ),
+    max_concurrency: int = typer.Option(
+        6, "--max-concurrency", "-c", help="Max concurrent pages"
+    ),
+    retries: int = typer.Option(
+        1, "--retries", "-r", help="Retries per URL on failure"
+    ),
+):
+    """Extract content from URLs and save as PDFs."""
+    import asyncio
+    asyncio.run(extract_run(url_file, out_dir, timeout_s, max_concurrency, retries))
+
+
 @cli.command("parse")
 def parse(
     input_file: str = typer.Option(
@@ -66,7 +88,6 @@ def parse(
     ),
 ):
     """Parse CTI content from collected URLs."""
-    # parse_run(input_file)  # parser 구현 시 주석 해제
     print(f"[yellow]Parser not implemented yet.[/yellow]")
     print(f"[cyan]Input file:[/cyan] {input_file}")
 

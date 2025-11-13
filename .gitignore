@@ -224,4 +224,5 @@ pyrightconfig.json
 
 ### Project Specific ###
 base_url.txt
-urls.txt
+data/
+output/
